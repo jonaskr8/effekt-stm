@@ -1,0 +1,449 @@
+import myUtil
+import test
+import scheduler
+
+type Id = Int
+extern """
+  var _lastid = 0
+"""
+extern type Cell[A]
+extern io def unsafeNew[A](init: A): Cell[A] = "{ value: ${init} }"
+extern io def unsafeRead[A](x: Cell[A]): A = "${x}.value"
+extern io def unsafeWrite[A](x: Cell[A], v: A): Unit = "(${x}.value = ${v})"
+extern io def unsafeId[A](x: Cell[A]): Id = "${x}.id"
+extern io def unsafeFresh(): Id = "_lastid++"
+record TVar(id: Id, cell: Cell[Int])
+
+// isFresh already paves the way for future introduction of exceptions. (see allocation heap)
+record Entry(tVar: TVar, oldValue: Int, newValue: Int, isFresh: Boolean)
+
+// There will be one Entry per TVar that was read or written in the transaction.
+// Multiple Writes of one TVar simply change the newValue, 
+// Reads look at newValue of the corresponding Entry.
+// oldValue is set when the first entry for a TVar is created 
+// isFresh is only true, if the TVar of the entry has been created within this transaction
+type Log = List[Entry]
+
+def assert(pred: Boolean, msg: String): Unit = {
+  if(not(pred)) {
+    panic(msg)
+  } else {
+    ()
+  }
+} 
+
+def myPrintln[A](msg: A): Unit = ()//println(msg)
+
+def onlyUniqueEntries[A, B](log: List[A]) {extractor: A => B}: Boolean = {
+  log match {
+    case Nil() => true
+    case Cons(x, xs) => 
+      val isDuplicate = xs.exists {y => extractor(y) == extractor(x)}
+      not(isDuplicate) && onlyUniqueEntries(xs) {extractor}
+  }
+}
+
+
+
+def read(log: Log, t: TVar): (Int, Log) = {
+  assert(log.onlyUniqueEntries { case Entry(TVar(id, _), _, _, _) => id}, "There should be only one entry per TVar")
+  // Falls Entry für t schon existiert, gebe Log unverändert zurück.
+  // Falls noch keine Entry für t existiert, füge Entry für t hinzu und setze oldValue und newValue zu currentValue
+  val entryForTVar = log.find{
+      case Entry(tVar, oldValue, newValue, isFresh) => t.id == tVar.id
+    }
+  entryForTVar match {
+    case None() => 
+      // unsafeRead, add new Entry
+      val currentValue = unsafeRead(t.cell);
+      (currentValue, Cons(Entry(t,currentValue, currentValue, false), log))
+    case Some(Entry(tVar, oldValue, newValue, isFresh)) =>
+      //We have already used t, so we don't modify the log.
+      (newValue, log)
+
+  }
+}
+
+def write(log: Log, t: TVar, newValue: Int): Log = {
+  assert(log.onlyUniqueEntries { case Entry(TVar(id, _), _, _, _) => id}, "There should be only one entry per TVar")
+  val entryForTVar = log.find{
+      case Entry(tVar, oldValue, newValue, isFresh) => t.id == tVar.id
+    }
+  entryForTVar match {
+    case None() =>
+      //unsafeRead, add new Entry, newValue is newValue
+      val currentValue = unsafeRead(t.cell)
+      Cons(Entry(t,currentValue, newValue, false), log)
+    case Some(Entry(tVar, oldValue, newV, isFresh)) =>
+      //Entry exists, so we modify it.
+      log.replaced(Entry(tVar, oldValue, newValue, isFresh)) {
+          case Entry(tVar, _, _, _) => tVar.id == t.id
+        }
+  }
+}
+
+def newLocalTVar(log: Log, initialValue: Int): (TVar, Log) = {
+  assert(log.onlyUniqueEntries { case Entry(TVar(id, _), _, _, _) => id}, "There should be only one entry per TVar")
+
+  val freshId: Id = unsafeFresh()
+  val newCell: Cell[Int] = unsafeNew(initialValue)
+  val t = TVar(freshId, newCell)
+  val newLog = Cons(Entry(t, initialValue, initialValue, true), log);
+  (t, newLog)
+}
+
+def isValid(entry: Entry): Boolean = {
+  entry match {
+    case Entry(tVar, oldValue, newValue, isFresh) => 
+      val currentEntry = unsafeRead(tVar.cell)
+      currentEntry == oldValue
+  }
+
+}
+
+def isValid(log: Log): Boolean = {
+  assert(log.onlyUniqueEntries { case Entry(TVar(id, _), _, _, _) => id}, "There should be only one entry per TVar")
+  var valid = true
+  log.foreach { entry => 
+    valid = valid && entry.isValid
+  }
+  valid
+}
+
+def commit(entry: Entry): Unit = {
+  entry match {
+    case Entry(tVar, oldValue, newValue, isFresh) => unsafeWrite(tVar.cell, newValue)
+  }
+}
+
+def commit(log: Log): Unit = {
+  assert(log.onlyUniqueEntries { case Entry(TVar(id, _), _, _, _) => id}, "There should be only one entry per TVar")
+  log.foreach { entry => entry.commit}
+}
+
+def hasChanged(entry: Entry): Boolean = {
+  entry match {
+    case Entry(TVar(id, cell), oldValue, newValue, _) => unsafeRead(cell) != oldValue
+  }
+}
+
+def hasChanged(log: Log): Boolean = {
+  log match {
+    case Nil() => false
+    case Cons(x, xs) => x.hasChanged || xs.hasChanged
+  }
+}
+
+
+interface Transaction {
+  def retry(): Nothing
+}
+
+interface Memory {
+  def newTVar(initialValue: Int): TVar
+  def readTVar(t: TVar): Int
+  def writeTVar(t: TVar, newValue: Int): Unit
+}
+interface OrElse {
+  def orElse[T](m1: => T / STM at {}, m2: => T / STM at {}): T 
+}
+
+effect STM = {Memory, Transaction, OrElse, Yield}
+
+def orElse[T] { m1: => T / STM }{ m2: => T / STM }: T / {Transaction, Memory, Yield, OrElse} = <>//orElse(box { m1 }, box { m2 })
+
+// Idea: Actually run the first program, but only construct the Log. If it succeeds, propagate the modified log to the parent transaction. 
+// If M1 retries, do the same for the second program. if M2 retries, propagate the retry
+def orElse[T](parentLog: Log, m1: => T / STM at {}, m2: => T / STM at {}): (T, Log)/ {Transaction, Yield} = {
+  try {
+  val (value1, log1) = simulateAtomic(parentLog) { m1 };
+  return (value1, log1)
+  } with Transaction {
+    def retry() = {
+      try {
+        val (value2, log2) = simulateAtomic(parentLog) { m2 };
+        return (value2, log2)
+      } with Transaction {
+        def retry() = {
+          do retry()
+        }
+      }
+    }
+  }
+}
+//TODO: simulateAtomic needs to handle Transaction and re-invoke it. In case it retries, 
+//we need to validate the log and re-execute entire outer transaction.
+def simulateAtomic[T](parentLog: Log) {prog: => T / STM}: (T, Log) / {Transaction, Yield} = {
+  var log = parentLog
+  try {
+    val value = prog()
+    if (log.isValid() && parentLog.isValid()) {
+      (value, log)
+    }
+    else {
+      (value, log) // TODO: Optimization: Somehow cause entire atomic to re-execute.
+    }
+  } with Memory {
+    def newTVar(initialValue: Int) = {
+      val (t, newLog)= log.newLocalTVar(initialValue)
+      log = newLog
+      resume(t)
+    }
+    def readTVar(t: TVar) = {
+      val (currentValue, newLog) = log.read(t)
+      log = newLog
+      resume(currentValue)
+    }
+    def writeTVar(t: TVar, newValue: Int) = {
+      val newLog = log.write(t, newValue)
+      log = newLog
+      resume(())
+    }
+  } with OrElse {
+    def orElse[T](m1: => T / STM at {}, m2: => T / STM at {}) = {
+      val (value, newLog) = orElse(log, m1, m2)
+      log = newLog
+      resume(value)
+    }  
+  } with Transaction {
+    def retry() = /*do validate();*/do retry() //TODO
+  }
+}
+
+def atomic[T](prog: => T / STM at {}): T / Yield = {
+  var log = []
+  try {
+    try {
+      val value = prog()
+      if (log.isValid()) {
+        log.commit(); return value
+      }
+      else {
+        atomic(prog)
+      }
+    } with Memory {
+      def newTVar(initialValue: Int) = {
+        val (t, newLog)= log.newLocalTVar(initialValue)
+        log = newLog
+        resume(t)
+      }
+      def readTVar(t: TVar) = {
+        val (currentValue, newLog) = log.read(t)
+        log = newLog
+        resume(currentValue)
+      }
+      def writeTVar(t: TVar, newValue: Int) = {
+        val newLog = log.write(t, newValue)
+        log = newLog
+        resume(())
+      }
+    } with OrElse {
+      def orElse[T](m1: => T / STM at {}, m2: => T / STM at {}) = {
+        val (value, newLog) = orElse(log, m1, m2)
+        log = newLog
+        resume(value)
+      }
+    } 
+  } with Transaction {
+    def retry() = {
+      def retryH(): T / Yield = {
+        if (log.hasChanged()) {
+          atomic(prog)
+        } else {
+          do yield();
+          retryH()
+        }
+      }
+
+      retryH()
+    }
+  }
+}
+
+def main() = {
+  /*unsafely define TVars, for testing purposes only.*/
+  def defineTVar(init: Int): TVar = {
+    val freshId: Id = unsafeFresh()
+    val newCell: Cell[Int] = unsafeNew(init)
+    TVar(freshId, newCell)
+  }
+
+  type Resource = TVar
+  def putR(r: Resource, amount: Int): Unit / {Transaction, Memory, Yield} = {
+    val v = do readTVar(r);
+    do writeTVar(r, v + amount)
+  }
+  def getR(r: Resource, amount: Int): Unit / {Transaction, Memory, Yield} = {
+    val v = do readTVar(r);
+    if (v < amount) {
+      do retry()
+    } else {
+      do writeTVar(r, v - amount)
+    }
+  }
+
+  // This ensures retry can be used instead of every other type
+  def getR2(r: Resource, amount: Int): Int / {Transaction, Memory, Yield} = {
+    val v = do readTVar(r);
+    if (v < amount) {
+      do retry() // typechecks as Int
+    } else {
+      do writeTVar(r, v - amount)
+      amount
+    }
+  }
+
+  def takeR1orR2(r1: TVar, r2: TVar, amount: Int): Unit / { OrElse } = {
+    do orElse(box { getR(r1, amount) }, box{ getR(r2, amount) })
+  }
+
+  //Not yet implemented, attempts to use implicit boxing
+  def takeR1orR2NotBoxed(r1: TVar, r2: TVar, amount: Int): Unit / { OrElse, Transaction, Memory, Yield } = {
+    orElse{getR(r1, amount)}{getR(r2,amount)}
+  }
+  
+  suite("orElse"){
+
+    test("First retries, second succeeds") {
+      val r1 = defineTVar(8)
+      val r2 = defineTVar(13)
+      val amount = 10
+      scheduler { atomic(box { takeR1orR2(r1,r2,amount) }) }
+      do assert(unsafeRead(r1.cell) == 8, "R1 should not change upon retry")
+      do assert(unsafeRead(r2.cell) == 3, "R2 should be 3!")
+    }
+    // test("Both retry [WARNING: endless loop]"){
+    //   val r1 = defineTVar(8)
+    //   val r2 = defineTVar(8)
+    //   scheduler { atomic {takeR1orR2(r1, r2, 10)} }
+    //   do assert(unsafeRead(r1.cell) == -10000, "We should never be here")
+    //   do assert(unsafeRead(r2.cell) == -10000, "We should never be here")
+    // }
+    test("First retries, second succeeds with outer Log") {
+      val r1 = defineTVar(8)
+      val r2 = defineTVar(8)
+      scheduler { atomic(box { 
+        val currentValue = do readTVar(r2)
+        do writeTVar(r2, currentValue + 5)
+        takeR1orR2(r1, r2, 10)
+        }) }
+      do assert(unsafeRead(r1.cell) == 8, "R1 should not change upon retry")
+      do assert(unsafeRead(r2.cell) == 3, "R2 should have gone from 8 to 13 to 3!")
+    }
+
+    test("doubly nested OrElse where inner orElse retries") {
+      val r1 = defineTVar(8)
+      val r2 = defineTVar(13)
+      scheduler { atomic(box { 
+        val currentValue = do readTVar(r1)
+        do orElse( 
+          box {
+            do writeTVar(r1, currentValue + 5)
+            do orElse( box { getR(r1, 20) }, box { getR(r1, 15) })
+          }, 
+          box {
+            getR(r1, 4)
+          } 
+        )
+        })
+      }
+      do assert(unsafeRead(r1.cell) == 4, "R1 should have gone from 8 to 4")      
+      do assert(unsafeRead(r2.cell) == 13, "R2 should not change, because the first transaction succeded!")
+    }
+
+    test("doubly nested OrElse where inner orElse succeeds") {
+      val r1 = defineTVar(8)
+      val r2 = defineTVar(13)
+      scheduler { atomic(box {
+        val currentValue = do readTVar(r1)
+        do orElse( box {
+          do writeTVar(r1, currentValue + 5)
+          do orElse(
+            box {
+            getR(r1, 20)  
+            }
+            , box {
+            getR(r1, 10)
+            }
+        )}
+         , box {
+          getR(r2, 4)
+        })
+        }) }
+      do assert(unsafeRead(r1.cell) == 3, "R1 should have gone from 8 to 13 to 3")      
+      do assert(unsafeRead(r2.cell) == 13, "R2 should not change, because the first transaction succeded!")
+    }
+
+    test("triple nested OrElse where inner orElse's fail") {
+      val r1 = defineTVar(8)
+      val r2 = defineTVar(13)
+      scheduler { 
+        atomic(box {
+        val currentValue = do readTVar(r1)
+        do orElse(box {
+            getR(r2, 1)
+            do writeTVar(r1, currentValue + 5) //r1 = 13
+            do orElse(box {
+              getR(r2, 1)
+              do writeTVar(r1, do readTVar(r1) + 5) //r1 = 18
+              do orElse(box { //retries 3
+                  getR(r2, 1)
+                  getR(r1, 20) } //retries 1
+                , box {
+                    getR(r2, 1)
+                    getR(r1, 21) 
+                  }//retries 2
+              ) }
+              , box {
+                  getR(r1, 15) //retries 4, because r1 = 13
+                }
+            )
+          }
+          , box {
+            getR(r1, 4) //succeeds.
+          }
+        )
+        }
+        ) 
+      }
+      do assert(unsafeRead(r1.cell) == 4, "R1 should have gone from 8 to 4")      
+      do assert(unsafeRead(r2.cell) == 13, "R2 should not change, because all transactions in which it was changed retried!")
+    }
+  } 
+  
+  suite("Retry") {
+    test("Retry") {
+      def get13(r1: Resource, r2: Resource): Unit / {Transaction, Memory, Yield} = {
+        val a = do readTVar(r1)
+        do yield()
+        getR(r2, 3)
+        getR(r1, 13)
+      }
+
+      def put1And1And1And1(r1: Resource): Unit / {Yield} = {
+        atomic(box { putR(r1, 1) })
+        do yield()
+        atomic(box { putR(r1, 1) })
+        do yield()
+        atomic(box { putR(r1, 1) })
+        do yield()
+        atomic(box { putR(r1, 1) })
+      }
+
+      def paperTest(r1: Resource, r2: Resource): Unit / {Yield, Fork} = {
+        fork {
+          atomic(box { get13(r1, r2) })
+        } {
+          put1And1And1And1(r1)
+        }
+      }
+
+      val r1 = defineTVar(10)
+      val r2 = defineTVar(10)
+      scheduler { paperTest(r1, r2)}
+      do assert(unsafeRead(r1.cell) == 1, "We should retry until we can take 13")
+      do assert(unsafeRead(r2.cell) == 7, "We should only take 3 once")
+    }
+  }
+
+}

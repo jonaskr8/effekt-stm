@@ -1,0 +1,57 @@
+import immutable/dequeue
+interface Yield {
+  def yield(): Unit
+}
+
+interface Fork {
+  def fork(): Boolean
+  def exit(): Unit
+}
+
+effect Proc = {Yield, Fork}
+
+// Don't worry about the `region` and `this` stuff for now,
+// it's just because first-class functions are a bit difficult in the presence of effects in Effekt.
+// It's quite OK to ignore them for now :)
+def scheduler { prog: => Unit / Proc } = region this {
+  var queue: Dequeue[() => Unit at {this, prog}] in this = emptyQueue();
+
+  def run(): Unit = {
+    queue.popBack match {
+      case None() => ()
+      case Some((k, q)) =>
+        queue = q
+        k();
+        run()
+    }
+  }
+  try {
+    prog()
+  } with Yield {
+    def yield() = {
+      queue = queue.pushFront(fun() { resume(()) })
+    }
+  } with Fork {
+    def fork() = {
+      queue = queue
+        .pushFront(fun() { resume(true) })
+        .pushFront(fun() { resume(false) })
+    }
+    def exit() = ()
+  }
+
+  run()
+}
+
+def fork { b1: => Unit / Proc } { b2: => Unit / Proc } =
+  if (do fork()) { b1() } else { b2() }
+
+
+def schedulerTest() = scheduler {
+    fork { 
+      do yield()
+      println("Hello1")
+    } {
+      println("Hello2")
+    }
+  }
