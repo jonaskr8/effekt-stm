@@ -1,10 +1,11 @@
-import immutable/dequeue
+import dequeue
+
 interface Yield {
   def yield(): Unit
 }
 
 interface Fork {
-  def fork(): Boolean
+  def fork(): Bool
   def exit(): Unit
 }
 
