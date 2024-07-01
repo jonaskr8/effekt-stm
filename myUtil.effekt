@@ -1,4 +1,4 @@
-def replaced[A](xs: List[A], elem: A) {comp: A => Boolean}: List[A] = {
+def replaced[A](xs: List[A], elem: A) {comp: A => Bool}: List[A] = {
   xs match {
     case Nil() => Nil()
     case Cons(y, ys) => 
@@ -10,14 +10,14 @@ def replaced[A](xs: List[A], elem: A) {comp: A => Boolean}: List[A] = {
   }
 }
 
-def exists[A](xs: List[A]) {pred: A => Boolean}: Boolean = {
+def exists[A](xs: List[A]) {pred: A => Bool}: Bool = {
   xs match {
     case Nil() => false
     case Cons(y, ys) => pred(y) || exists(ys) {pred}
   }
 }
 
-def find[A](xs: List[A]) {comp: A => Boolean}: Option[A] = {
+def find[A](xs: List[A]) {comp: A => Bool}: Option[A] = {
   xs match {
     case Nil() => None()
     case Cons(y, ys) => 
